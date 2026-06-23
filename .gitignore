@@ -1,0 +1,7 @@
+*.log
+*.tmp
+*.bak
+*.zip
+downloads/
+test-output/
+python-portable-migration-manifest*.json
