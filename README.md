@@ -35,15 +35,15 @@ Do not run this unless you intend to mutate the real machine:
 powershell -NoProfile -ExecutionPolicy Bypass -File .\Move-Python-ToExternalPortable.ps1
 ```
 
-The script fails if Python processes are running, the target is not writable, unsupported Python remnants are found, or verification cannot prove the external wrappers are usable.
+By default, the script closes blocking Python processes before migration so running interpreters do not keep C: files locked. It first asks windowed processes to close, then force-stops remaining Python-related blockers and rechecks before moving data.
 
-If Python processes are running and you intentionally want the script to stop them before migration, use:
+If you intentionally do not want the script to close running Python jobs, use:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\Move-Python-ToExternalPortable.ps1 -StopBlockingPythonProcesses
+powershell -NoProfile -ExecutionPolicy Bypass -File .\Move-Python-ToExternalPortable.ps1 -PreserveBlockingPythonProcesses
 ```
 
-This is opt-in because stopping live Python can interrupt editors, agents, package managers, servers, or other running tools.
+With `-PreserveBlockingPythonProcesses`, the script fails before migration if any Python process is still running. The script also fails if the target is not writable, unsupported Python remnants are found, or verification cannot prove the external wrappers are usable.
 
 If Microsoft Store Python packages are the only unsupported remnants and you want the script to remove them too, use:
 
@@ -59,7 +59,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\Undo-Move-Python-ToExterna
 
 Undo reads the migration manifest from the target directory and restores the changes recorded there.
 
-Undo also has `-StopBlockingPythonProcesses` for the same opt-in reason.
+Undo uses the same default behavior and closes blocking Python processes before restore. Use `-PreserveBlockingPythonProcesses` to opt out.
 
 If the migration removed Store Python packages and you want undo to attempt a best-effort `winget` reinstall, use:
 

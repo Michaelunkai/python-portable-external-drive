@@ -39,6 +39,25 @@ function Test-PathIsOnDrive {
     return $full.StartsWith("$DriveLetter`:\", [System.StringComparison]::OrdinalIgnoreCase)
 }
 
+function Test-PathIsUnderRoot {
+    param(
+        [string]$Path,
+        [string]$Root
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path) -or [string]::IsNullOrWhiteSpace($Root)) {
+        return $false
+    }
+    try {
+        $full = [System.IO.Path]::GetFullPath($Path).TrimEnd('\')
+        $rootFull = [System.IO.Path]::GetFullPath($Root).TrimEnd('\')
+        return $full.Equals($rootFull, [System.StringComparison]::OrdinalIgnoreCase) -or
+            $full.StartsWith("$rootFull\", [System.StringComparison]::OrdinalIgnoreCase)
+    } catch {
+        return $false
+    }
+}
+
 function Assert-PortableTarget {
     param(
         [Parameter(Mandatory)][string]$TargetRoot,
@@ -108,46 +127,84 @@ function Get-DirectorySizeBytes {
 }
 
 function Get-PythonProcessSnapshot {
-    Get-Process -ErrorAction SilentlyContinue |
+    param([string]$PathRoot)
+
+    $processes = Get-Process -ErrorAction SilentlyContinue |
         Where-Object {
             $_.Id -ne 0 -and
             $_.ProcessName -ne 'Idle' -and
             $_.ProcessName -match '^(python|pythonw|py|pip|jupyter|ipython)$'
         } |
         Select-Object Id, ProcessName, Path
+
+    if ([string]::IsNullOrWhiteSpace($PathRoot)) {
+        return $processes
+    }
+    return $processes | Where-Object { Test-PathIsUnderRoot -Path $_.Path -Root $PathRoot }
+}
+
+function Stop-PythonProcessSnapshot {
+    param(
+        [Parameter(Mandatory)]$Processes,
+        [int]$GraceSeconds = 2
+    )
+
+    $stopErrors = @()
+    foreach ($process in @($Processes)) {
+        try {
+            $liveProcess = Get-Process -Id $process.Id -ErrorAction SilentlyContinue
+            if ($null -eq $liveProcess) {
+                continue
+            }
+
+            $closedGracefully = $false
+            try {
+                if ($liveProcess.MainWindowHandle -ne 0) {
+                    $closedGracefully = $liveProcess.CloseMainWindow()
+                    if ($closedGracefully) {
+                        [void]$liveProcess.WaitForExit($GraceSeconds * 1000)
+                    }
+                }
+            } catch {
+                $closedGracefully = $false
+            }
+
+            $liveProcess = Get-Process -Id $process.Id -ErrorAction SilentlyContinue
+            if ($null -ne $liveProcess -and -not $liveProcess.HasExited) {
+                Stop-Process -Id $process.Id -Force -ErrorAction Stop
+            }
+        } catch {
+            $path = if ([string]::IsNullOrWhiteSpace($process.Path)) { '<unknown>' } else { $process.Path }
+            $stopErrors += "  - $($process.ProcessName) pid=$($process.Id) path=$path error=$($_.Exception.Message)"
+        }
+    }
+    return $stopErrors
 }
 
 function Assert-NoPythonProcesses {
     param(
         [switch]$SkipProcessCheck,
-        [switch]$StopBlockingPythonProcesses
+        [switch]$StopBlockingPythonProcesses,
+        [string]$ProcessPathRootForTests
     )
 
     if ($SkipProcessCheck) {
         return
     }
-    $running = @(Get-PythonProcessSnapshot)
+    $running = @(Get-PythonProcessSnapshot -PathRoot $ProcessPathRootForTests)
     if ($running.Count -gt 0) {
         $stopAttemptDetails = ''
         if ($StopBlockingPythonProcesses) {
             $stopErrors = @()
-            foreach ($process in $running) {
-                try {
-                    $liveProcess = Get-Process -Id $process.Id -ErrorAction SilentlyContinue
-                    if ($null -ne $liveProcess) {
-                        Stop-Process -Id $process.Id -Force -ErrorAction Stop
-                    }
-                } catch {
-                    $path = if ([string]::IsNullOrWhiteSpace($process.Path)) { '<unknown>' } else { $process.Path }
-                    $stopErrors += "  - $($process.ProcessName) pid=$($process.Id) path=$path error=$($_.Exception.Message)"
+            foreach ($attempt in 1..5) {
+                $stopErrors += @(Stop-PythonProcessSnapshot -Processes $running)
+                Start-Sleep -Milliseconds 750
+                $remaining = @(Get-PythonProcessSnapshot -PathRoot $ProcessPathRootForTests)
+                if ($remaining.Count -eq 0) {
+                    return
                 }
+                $running = $remaining
             }
-            Start-Sleep -Seconds 2
-            $remaining = @(Get-PythonProcessSnapshot)
-            if ($remaining.Count -eq 0) {
-                return
-            }
-            $running = $remaining
             if ($stopErrors.Count -gt 0) {
                 $stopAttemptDetails = @"
 
@@ -161,8 +218,13 @@ $($stopErrors -join "`n")
             $path = if ([string]::IsNullOrWhiteSpace($_.Path)) { '<unknown>' } else { $_.Path }
             "  - $($_.ProcessName) pid=$($_.Id) path=$path"
         }
+        $opening = if ($StopBlockingPythonProcesses) {
+            'Python-related processes are still running after automatic close attempts, so migration did not start.'
+        } else {
+            'Python-related processes are running, so migration did not start.'
+        }
         throw @"
-Python-related processes are running, so migration did not start.
+$opening
 
 This is a safety stop. Moving Python while any Python interpreter is active can corrupt virtual environments, running tools, caches, or the migration itself.
 
@@ -171,9 +233,10 @@ $($lines -join "`n")
 $stopAttemptDetails
 
 Safe options:
-  1. Close apps/tasks using Python, then rerun this script.
-  2. If you intentionally want this script to stop those Python processes first, rerun with -StopBlockingPythonProcesses.
-  3. Do not use -SkipProcessCheck unless you accept the risk of moving files used by live processes.
+  1. Rerun this script as Administrator if Windows denied closing one of the listed processes.
+  2. Close any process supervisor that immediately respawns Python, then rerun this script.
+  3. Use -PreserveBlockingPythonProcesses only if you intentionally do not want this script to close Python jobs.
+  4. Do not use -SkipProcessCheck unless you accept the risk of moving files used by live processes.
 "@
     }
 }
@@ -816,13 +879,14 @@ function Invoke-PortablePythonMigration {
         [switch]$AllowNonFDriveForTests,
         [switch]$SkipProcessCheck,
         [switch]$StopBlockingPythonProcesses,
+        [string]$ProcessPathRootForTests,
         [switch]$RemoveStorePythonPackages,
         [UInt64]$AllowedRemnantBytes = 0
     )
 
     $context = Get-PortablePythonContext -TargetRoot $TargetRoot -SystemDriveRoot $SystemDriveRoot -UserProfileRoot $UserProfileRoot -TestMode:$TestMode -AllowNonFDriveForTests:$AllowNonFDriveForTests
     Assert-PortableTarget -TargetRoot $context.TargetRoot -AllowNonFDriveForTests:$AllowNonFDriveForTests
-    Assert-NoPythonProcesses -SkipProcessCheck:$SkipProcessCheck -StopBlockingPythonProcesses:$StopBlockingPythonProcesses
+    Assert-NoPythonProcesses -SkipProcessCheck:$SkipProcessCheck -StopBlockingPythonProcesses:$StopBlockingPythonProcesses -ProcessPathRootForTests $ProcessPathRootForTests
 
     if (Test-Path -LiteralPath $context.ManifestPath -PathType Leaf) {
         throw "Existing manifest found. Run undo first or move the old target aside: $($context.ManifestPath)"
@@ -912,11 +976,12 @@ function Invoke-PortablePythonUndo {
         [switch]$AllowNonFDriveForTests,
         [switch]$SkipProcessCheck,
         [switch]$StopBlockingPythonProcesses,
+        [string]$ProcessPathRootForTests,
         [switch]$AttemptStorePythonPackageReinstall
     )
 
     $context = Get-PortablePythonContext -TargetRoot $TargetRoot -SystemDriveRoot $SystemDriveRoot -UserProfileRoot $UserProfileRoot -TestMode:$TestMode -AllowNonFDriveForTests:$AllowNonFDriveForTests
-    Assert-NoPythonProcesses -SkipProcessCheck:$SkipProcessCheck -StopBlockingPythonProcesses:$StopBlockingPythonProcesses
+    Assert-NoPythonProcesses -SkipProcessCheck:$SkipProcessCheck -StopBlockingPythonProcesses:$StopBlockingPythonProcesses -ProcessPathRootForTests $ProcessPathRootForTests
     $undoReceipt = Join-Path $context.TargetRoot 'python-portable-migration-manifest.undone.json'
     if (-not (Test-Path -LiteralPath $context.ManifestPath -PathType Leaf)) {
         if (Test-Path -LiteralPath $undoReceipt -PathType Leaf) {

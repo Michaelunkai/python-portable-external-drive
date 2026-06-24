@@ -12,7 +12,9 @@ param(
     [switch]$TestMode,
     [switch]$AllowNonFDriveForTests,
     [switch]$SkipProcessCheck,
-    [switch]$StopBlockingPythonProcesses
+    [switch]$StopBlockingPythonProcesses,
+    [switch]$PreserveBlockingPythonProcesses,
+    [string]$ProcessPathRootForTests
 )
 
 Set-StrictMode -Version Latest
@@ -22,6 +24,7 @@ $modulePath = Join-Path $PSScriptRoot 'PythonPortableCommon.psm1'
 Import-Module $modulePath -Force
 
 try {
+    $shouldStopBlockingPythonProcesses = (-not $PreserveBlockingPythonProcesses) -or $StopBlockingPythonProcesses
     Invoke-PortablePythonMigration `
         -TargetRoot $TargetRoot `
         -SystemDriveRoot $SystemDriveRoot `
@@ -33,7 +36,8 @@ try {
         -TestMode:$TestMode `
         -AllowNonFDriveForTests:$AllowNonFDriveForTests `
         -SkipProcessCheck:$SkipProcessCheck `
-        -StopBlockingPythonProcesses:$StopBlockingPythonProcesses
+        -StopBlockingPythonProcesses:$shouldStopBlockingPythonProcesses `
+        -ProcessPathRootForTests $ProcessPathRootForTests
 } catch {
     Write-Host $_.Exception.Message
     exit 1

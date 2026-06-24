@@ -9,6 +9,8 @@ param(
     [switch]$AllowNonFDriveForTests,
     [switch]$SkipProcessCheck,
     [switch]$StopBlockingPythonProcesses,
+    [switch]$PreserveBlockingPythonProcesses,
+    [string]$ProcessPathRootForTests,
     [switch]$AttemptStorePythonPackageReinstall
 )
 
@@ -19,6 +21,7 @@ $modulePath = Join-Path $PSScriptRoot 'PythonPortableCommon.psm1'
 Import-Module $modulePath -Force
 
 try {
+    $shouldStopBlockingPythonProcesses = (-not $PreserveBlockingPythonProcesses) -or $StopBlockingPythonProcesses
     Invoke-PortablePythonUndo `
         -TargetRoot $TargetRoot `
         -SystemDriveRoot $SystemDriveRoot `
@@ -26,7 +29,8 @@ try {
         -TestMode:$TestMode `
         -AllowNonFDriveForTests:$AllowNonFDriveForTests `
         -SkipProcessCheck:$SkipProcessCheck `
-        -StopBlockingPythonProcesses:$StopBlockingPythonProcesses `
+        -StopBlockingPythonProcesses:$shouldStopBlockingPythonProcesses `
+        -ProcessPathRootForTests $ProcessPathRootForTests `
         -AttemptStorePythonPackageReinstall:$AttemptStorePythonPackageReinstall
 } catch {
     Write-Host $_.Exception.Message

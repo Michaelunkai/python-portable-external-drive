@@ -91,11 +91,13 @@ function Invoke-ChildPowerShell {
 function Invoke-MoveScript {
     param(
         [Parameter(Mandatory)]$Fixture,
-    [string]$EmbeddedPythonZip,
+        [string]$EmbeddedPythonZip,
         [switch]$DownloadIfMissing,
         [switch]$ExpectFailure,
         [switch]$RemoveStorePythonPackages,
         [switch]$EnableProcessCheck,
+        [switch]$PreserveBlockingPythonProcesses,
+        [string]$ProcessPathRootForTests,
         [UInt64]$AllowedRemnantBytes = 0
     )
 
@@ -113,6 +115,12 @@ function Invoke-MoveScript {
     if (-not $EnableProcessCheck) {
         $args += '-SkipProcessCheck'
     }
+    if ($PreserveBlockingPythonProcesses) {
+        $args += '-PreserveBlockingPythonProcesses'
+    }
+    if ($ProcessPathRootForTests) {
+        $args += @('-ProcessPathRootForTests', $ProcessPathRootForTests)
+    }
     if ($EmbeddedPythonZip) {
         $args += @('-EmbeddedPythonZip', $EmbeddedPythonZip)
     }
@@ -129,9 +137,29 @@ function Invoke-MoveScript {
     $result
 }
 
-function Invoke-UndoScript {
+function New-TestOwnedPythonProcess {
     param([Parameter(Mandatory)]$Fixture)
-    Invoke-ChildPowerShell -Arguments @(
+
+    $processRoot = Join-Path $Fixture.C 'BlockingPythonProcess'
+    New-Item -ItemType Directory -Path $processRoot -Force | Out-Null
+    $fakePython = Join-Path $processRoot 'python.exe'
+    Copy-Item -LiteralPath "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe" -Destination $fakePython -Force
+    $started = Start-Process -FilePath $fakePython `
+        -ArgumentList '-NoProfile -Command Start-Sleep -Seconds 60' `
+        -WindowStyle Hidden `
+        -PassThru
+    Start-Sleep -Seconds 1
+    return $started
+}
+
+function Invoke-UndoScript {
+    param(
+        [Parameter(Mandatory)]$Fixture,
+        [switch]$EnableProcessCheck,
+        [switch]$PreserveBlockingPythonProcesses,
+        [string]$ProcessPathRootForTests
+    )
+    $args = @(
         '-NoProfile',
         '-ExecutionPolicy', 'Bypass',
         '-File', (Join-Path $PSScriptRoot 'Undo-Move-Python-ToExternalPortable.ps1'),
@@ -139,9 +167,18 @@ function Invoke-UndoScript {
         '-SystemDriveRoot', $Fixture.C,
         '-UserProfileRoot', $Fixture.Profile,
         '-TestMode',
-        '-AllowNonFDriveForTests',
-        '-SkipProcessCheck'
+        '-AllowNonFDriveForTests'
     )
+    if (-not $EnableProcessCheck) {
+        $args += '-SkipProcessCheck'
+    }
+    if ($PreserveBlockingPythonProcesses) {
+        $args += '-PreserveBlockingPythonProcesses'
+    }
+    if ($ProcessPathRootForTests) {
+        $args += @('-ProcessPathRootForTests', $ProcessPathRootForTests)
+    }
+    Invoke-ChildPowerShell -Arguments $args
 }
 
 function Test-MoveAndUndo {
@@ -229,41 +266,14 @@ function Test-RemoveUnsupportedInTestMode {
     }
 }
 
-function Test-BlockingProcessOutputIsClean {
+function Test-PreserveBlockingProcessOutputIsClean {
     $fx = New-TestRoot
     $started = $null
     try {
-        $pythonPath = where.exe python 2>$null | Where-Object {
-            $_ -and
-            (Test-Path -LiteralPath $_ -PathType Leaf) -and
-            ($_ -notmatch '\\WindowsApps\\')
-        } | Select-Object -First 1
-        if (-not $pythonPath) {
-            $fallbackRoots = @(
-                (Join-Path $env:LOCALAPPDATA 'Programs\Python'),
-                (Join-Path $env:APPDATA 'uv\python'),
-                (Join-Path $env:LOCALAPPDATA 'uv'),
-                (Join-Path $env:USERPROFILE '.codex\tools')
-            )
-            foreach ($root in $fallbackRoots) {
-                if (Test-Path -LiteralPath $root) {
-                    $pythonPath = Get-ChildItem -LiteralPath $root -Recurse -Filter python.exe -File -ErrorAction SilentlyContinue |
-                        Select-Object -ExpandProperty FullName -First 1
-                    if ($pythonPath) { break }
-                }
-            }
-        }
-        if (-not $pythonPath) {
-            return
-        }
-        $started = Start-Process -FilePath $pythonPath `
-            -ArgumentList '-c "import time; time.sleep(60)"' `
-            -WindowStyle Hidden `
-            -PassThru
-        Start-Sleep -Seconds 2
+        $started = New-TestOwnedPythonProcess -Fixture $fx
         New-FakePythonTree -Fixture $fx
         New-Item -ItemType Directory -Path $fx.FTarget -Force | Out-Null
-        $result = Invoke-MoveScript -Fixture $fx -ExpectFailure -EnableProcessCheck
+        $result = Invoke-MoveScript -Fixture $fx -ExpectFailure -EnableProcessCheck -PreserveBlockingPythonProcesses -ProcessPathRootForTests $fx.C
         Assert-True ($result.ExitCode -ne 0) 'blocking Python process should fail before migration'
         Assert-True ($result.Output -match 'Python-related processes are running') 'blocking process output should explain safety stop'
         Assert-True ($result.Output -match "pid=$($started.Id)") 'blocking process output should include the test-owned Python process'
@@ -277,10 +287,59 @@ function Test-BlockingProcessOutputIsClean {
     }
 }
 
+function Test-DefaultAutoStopsBlockingProcess {
+    $fx = New-TestRoot
+    $started = $null
+    try {
+        $started = New-TestOwnedPythonProcess -Fixture $fx
+        New-FakePythonTree -Fixture $fx
+        New-Item -ItemType Directory -Path $fx.FTarget -Force | Out-Null
+        $result = Invoke-MoveScript -Fixture $fx -EnableProcessCheck -ProcessPathRootForTests $fx.C
+        Assert-True ($result.ExitCode -eq 0) 'default move should stop blocking Python process and continue'
+        Assert-True ($result.Output -match 'Ready') 'default move after auto-stop should report Ready'
+        Start-Sleep -Seconds 1
+        $stillRunning = Get-Process -Id $started.Id -ErrorAction SilentlyContinue
+        Assert-True ($null -eq $stillRunning) 'default move should close the test-owned Python process'
+        Assert-True (Test-Path -LiteralPath (Join-Path $fx.FTarget 'bin\python.cmd')) 'move should still create python wrapper after auto-stop'
+    } finally {
+        if ($started -and -not $started.HasExited) {
+            Stop-Process -Id $started.Id -Force -ErrorAction SilentlyContinue
+        }
+        Remove-Item -LiteralPath $fx.Root -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Test-UndoDefaultAutoStopsBlockingProcess {
+    $fx = New-TestRoot
+    $started = $null
+    try {
+        New-FakePythonTree -Fixture $fx
+        New-Item -ItemType Directory -Path $fx.FTarget -Force | Out-Null
+        $move = Invoke-MoveScript -Fixture $fx
+        Assert-True ($move.ExitCode -eq 0) 'setup move for undo auto-stop test should exit 0'
+
+        $started = New-TestOwnedPythonProcess -Fixture $fx
+        $undo = Invoke-UndoScript -Fixture $fx -EnableProcessCheck -ProcessPathRootForTests $fx.C
+        Assert-True ($undo.ExitCode -eq 0) 'default undo should stop blocking Python process and continue'
+        Assert-True ($undo.Output -match 'Undone') 'default undo after auto-stop should report Undone'
+        Start-Sleep -Seconds 1
+        $stillRunning = Get-Process -Id $started.Id -ErrorAction SilentlyContinue
+        Assert-True ($null -eq $stillRunning) 'default undo should close the test-owned Python process'
+        Assert-True (Test-Path -LiteralPath (Join-Path $fx.Profile 'AppData\Local\Programs\Python')) 'undo should restore original Python path after auto-stop'
+    } finally {
+        if ($started -and -not $started.HasExited) {
+            Stop-Process -Id $started.Id -Force -ErrorAction SilentlyContinue
+        }
+        Remove-Item -LiteralPath $fx.Root -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 Test-MoveAndUndo
 Test-FreshBootstrap
 Test-FailClosedUnsupported
 Test-RemoveUnsupportedInTestMode
-Test-BlockingProcessOutputIsClean
+Test-PreserveBlockingProcessOutputIsClean
+Test-DefaultAutoStopsBlockingProcess
+Test-UndoDefaultAutoStopsBlockingProcess
 
 "PASS: $script:PassCount assertions"
