@@ -92,8 +92,9 @@ function Invoke-MoveScript {
     param(
         [Parameter(Mandatory)]$Fixture,
     [string]$EmbeddedPythonZip,
-    [switch]$DownloadIfMissing,
+        [switch]$DownloadIfMissing,
         [switch]$ExpectFailure,
+        [switch]$RemoveStorePythonPackages,
     [UInt64]$AllowedRemnantBytes = 0
     )
 
@@ -114,6 +115,9 @@ function Invoke-MoveScript {
     }
     if ($DownloadIfMissing) {
         $args += '-DownloadIfMissing'
+    }
+    if ($RemoveStorePythonPackages) {
+        $args += '-RemoveStorePythonPackages'
     }
     $result = Invoke-ChildPowerShell -Arguments $args
     if (-not $ExpectFailure -and $result.ExitCode -ne 0) {
@@ -154,6 +158,7 @@ function Test-MoveAndUndo {
         Assert-True (Test-Path -LiteralPath (Join-Path $fx.FTarget 'python-portable-migration-manifest.json')) 'manifest should exist'
         $testEnv = Get-Content -LiteralPath (Join-Path $fx.FTarget 'test-env.json') -Raw | ConvertFrom-Json
         Assert-True ($testEnv.Path.StartsWith((Join-Path $fx.FTarget 'bin'))) 'PATH should start with target bin'
+        Assert-True ($testEnv.Path -match [regex]::Escape((Join-Path $fx.FTarget 'migrated'))) 'PATH should include migrated external Python tree'
         Assert-True ($testEnv.PIP_CACHE_DIR -eq (Join-Path $fx.FTarget 'pip-cache')) 'PIP_CACHE_DIR should point to target'
 
         $undo = Invoke-UndoScript -Fixture $fx
@@ -200,8 +205,30 @@ function Test-FailClosedUnsupported {
     }
 }
 
+function Test-RemoveUnsupportedInTestMode {
+    $fx = New-TestRoot
+    try {
+        New-FakePythonTree -Fixture $fx
+        $unsupported = Join-Path $fx.C 'Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.13_test'
+        New-Item -ItemType Directory -Path $unsupported -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $unsupported 'python.exe') -Value 'fake' -Encoding ASCII
+        New-Item -ItemType Directory -Path $fx.FTarget -Force | Out-Null
+        $result = Invoke-MoveScript -Fixture $fx -RemoveStorePythonPackages
+        Assert-True ($result.ExitCode -eq 0) 'RemoveStorePythonPackages test mode should succeed'
+        Assert-True (-not (Test-Path -LiteralPath $unsupported)) 'unsupported path should be removed from fake C root'
+        $manifest = Get-Content -LiteralPath (Join-Path $fx.FTarget 'python-portable-migration-manifest.json') -Raw | ConvertFrom-Json
+        Assert-True (@($manifest.RemovedUnsupportedItems).Count -ge 1) 'manifest should record removed unsupported items'
+        $undo = Invoke-UndoScript -Fixture $fx
+        Assert-True ($undo.ExitCode -eq 0) 'undo after unsupported removal should exit 0'
+        Assert-True (Test-Path -LiteralPath $unsupported) 'undo should restore fake unsupported path'
+    } finally {
+        Remove-Item -LiteralPath $fx.Root -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 Test-MoveAndUndo
 Test-FreshBootstrap
 Test-FailClosedUnsupported
+Test-RemoveUnsupportedInTestMode
 
 "PASS: $script:PassCount assertions"

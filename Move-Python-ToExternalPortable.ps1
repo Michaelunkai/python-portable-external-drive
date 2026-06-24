@@ -3,6 +3,7 @@ param(
     [string]$TargetRoot = 'F:\backup\windowsapps\AppsBackups\python',
     [string]$EmbeddedPythonZip,
     [switch]$DownloadIfMissing,
+    [switch]$RemoveStorePythonPackages,
     [UInt64]$AllowedRemnantBytes = 0,
 
     # Test harness only. Do not use these for real migration.
@@ -25,6 +26,7 @@ Invoke-PortablePythonMigration `
     -UserProfileRoot $UserProfileRoot `
     -EmbeddedPythonZip $EmbeddedPythonZip `
     -DownloadIfMissing:$DownloadIfMissing `
+    -RemoveStorePythonPackages:$RemoveStorePythonPackages `
     -AllowedRemnantBytes $AllowedRemnantBytes `
     -TestMode:$TestMode `
     -AllowNonFDriveForTests:$AllowNonFDriveForTests `

@@ -265,6 +265,7 @@ function New-PortablePythonManifest {
         CreatedItems = @()
         EnvironmentChanges = @()
         PathEntriesRemoved = @()
+        RemovedUnsupportedItems = @()
         UnsupportedRemnants = @()
         Verification = @()
     }
@@ -346,6 +347,76 @@ function Find-PortablePythonCommand {
         }
     }
     return $null
+}
+
+function Get-ExternalPythonPathEntries {
+    param(
+        [Parameter(Mandatory)]$Context,
+        [Parameter(Mandatory)][string]$PythonCommand
+    )
+
+    $entries = New-Object System.Collections.Generic.List[string]
+    foreach ($path in @($Context.BinRoot, (Split-Path -Path $PythonCommand -Parent))) {
+        if ($path -and -not $entries.Contains($path)) {
+            $entries.Add($path)
+        }
+    }
+
+    $searchRoots = @($Context.MigratedRoot, $Context.RuntimeRoot) | Where-Object { Test-Path -LiteralPath $_ }
+    foreach ($root in $searchRoots) {
+        Get-ChildItem -LiteralPath $root -Directory -Recurse -Force -Filter 'Scripts' -ErrorAction SilentlyContinue |
+            ForEach-Object {
+                if (-not $entries.Contains($_.FullName)) {
+                    $entries.Add($_.FullName)
+                }
+            }
+    }
+    return @($entries)
+}
+
+function Get-CDrivePythonEnvironmentEntries {
+    param(
+        [Parameter(Mandatory)]$Context,
+        [string]$Name = 'Path',
+        [string]$Scope = 'User'
+    )
+
+    $value = Get-PortableEnvironmentValue -Context $Context -Name $Name -Scope $Scope
+    if ([string]::IsNullOrWhiteSpace($value)) {
+        return @()
+    }
+    $system = $Context.SystemDriveRoot.TrimEnd('\')
+    @($value -split ';' | Where-Object {
+        $expanded = [Environment]::ExpandEnvironmentVariables($_)
+        $expanded.StartsWith($system, [System.StringComparison]::OrdinalIgnoreCase) -and $expanded -match '(?i)python|pip|pypa'
+    })
+}
+
+function Assert-NoBlockingMachinePythonEnvironment {
+    param([Parameter(Mandatory)]$Context)
+
+    if ($Context.TestMode) {
+        return
+    }
+
+    $blocking = @()
+    foreach ($name in @('Path','PYTHONPATH','PYTHONHOME','PYTHONUSERBASE','PYTHONPYCACHEPREFIX','PIP_CACHE_DIR','PIP_CONFIG_FILE')) {
+        $value = [Environment]::GetEnvironmentVariable($name, 'Machine')
+        if ([string]::IsNullOrWhiteSpace($value)) {
+            continue
+        }
+        $expanded = [Environment]::ExpandEnvironmentVariables($value)
+        if ($expanded.StartsWith($Context.SystemDriveRoot.TrimEnd('\'), [System.StringComparison]::OrdinalIgnoreCase) -and $expanded -match '(?i)python|pip|pypa') {
+            $blocking += "$name=$value"
+        }
+        if ($name -eq 'Path') {
+            $blocking += @(Get-CDrivePythonEnvironmentEntries -Context $Context -Name $name -Scope 'Machine' | ForEach-Object { "Path entry=$_" })
+        }
+    }
+
+    if ($blocking.Count -gt 0) {
+        throw "Machine-level Python environment entries still point at C:. Remove or migrate them explicitly, then rerun:`n$($blocking -join "`n")"
+    }
 }
 
 function Resolve-LatestEmbeddablePythonUri {
@@ -462,6 +533,58 @@ user = true
     Add-ManifestArrayItem -Manifest $Manifest -Key 'CreatedItems' -Value $pipIni
 }
 
+function Remove-UnsupportedPythonPackages {
+    param(
+        [Parameter(Mandatory)]$Context,
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Manifest,
+        [Parameter(Mandatory)]$UnsupportedItems,
+        [switch]$RemoveStorePythonPackages
+    )
+
+    $blocking = @($UnsupportedItems | Where-Object { $_.Bytes -gt 0 })
+    if ($blocking.Count -eq 0) {
+        return
+    }
+    if (-not $RemoveStorePythonPackages) {
+        $Manifest['UnsupportedRemnants'] = @($blocking)
+        Save-PortablePythonManifest -Manifest $Manifest -Path $Context.ManifestPath
+        $details = $blocking | ForEach-Object { "$($_.Classification): $($_.Path) ($($_.Bytes) bytes)" }
+        throw "Unclassified or unsupported Python-related C: paths were found. Refusing to guess:`n$($details -join "`n")"
+    }
+
+    if ($Context.TestMode) {
+        foreach ($item in $blocking) {
+            $relative = ConvertTo-PortableRelativePath -Path $item.Path -SystemDriveRoot $Context.SystemDriveRoot
+            $quarantine = Join-PortablePath @($Context.MigratedRoot, 'removed-unsupported-C', $relative)
+            New-Item -ItemType Directory -Path (Split-Path -Path $quarantine -Parent) -Force | Out-Null
+            Move-Item -LiteralPath $item.Path -Destination $quarantine -Force
+            Add-ManifestArrayItem -Manifest $Manifest -Key 'RemovedUnsupportedItems' -Value ([ordered]@{
+                OriginalPath = $item.Path
+                ExternalPath = $quarantine
+                Method = 'TestModeMove'
+            })
+        }
+        return
+    }
+
+    $packages = @(Get-AppxPackage -AllUsers -Name 'PythonSoftwareFoundation.Python*' -ErrorAction SilentlyContinue)
+    if ($packages.Count -eq 0) {
+        $Manifest['UnsupportedRemnants'] = @($blocking)
+        Save-PortablePythonManifest -Manifest $Manifest -Path $Context.ManifestPath
+        $details = $blocking | ForEach-Object { "$($_.Classification): $($_.Path) ($($_.Bytes) bytes)" }
+        throw "Store Python remnants exist but no removable Appx package was found:`n$($details -join "`n")"
+    }
+    foreach ($pkg in $packages) {
+        Add-ManifestArrayItem -Manifest $Manifest -Key 'RemovedUnsupportedItems' -Value ([ordered]@{
+            PackageFullName = $pkg.PackageFullName
+            Name = $pkg.Name
+            InstallLocation = $pkg.InstallLocation
+            Method = 'Remove-AppxPackage'
+        })
+        Remove-AppxPackage -Package $pkg.PackageFullName -AllUsers -ErrorAction Stop
+    }
+}
+
 function Get-PortableEnvironmentValue {
     param(
         [Parameter(Mandatory)]$Context,
@@ -518,6 +641,7 @@ function Remove-CDrivePythonPathEntries {
     param(
         [Parameter(Mandatory)]$Context,
         [Parameter(Mandatory)][System.Collections.IDictionary]$Manifest,
+        [string[]]$ExternalPathEntries = @($Context.BinRoot),
         [string]$Scope = 'User'
     )
 
@@ -540,7 +664,7 @@ function Remove-CDrivePythonPathEntries {
     foreach ($entry in $removed) {
         Add-ManifestArrayItem -Manifest $Manifest -Key 'PathEntriesRemoved' -Value ([ordered]@{ Scope = $Scope; Entry = $entry })
     }
-    $newEntries = @($Context.BinRoot) + @($kept | Where-Object { $_ -ne $Context.BinRoot })
+    $newEntries = @($ExternalPathEntries) + @($kept | Where-Object { $ExternalPathEntries -notcontains $_ })
     Set-PortableEnvironmentValue -Context $Context -Manifest $Manifest -Name 'Path' -Value ($newEntries -join ';') -Scope $Scope
 }
 
@@ -548,10 +672,12 @@ function Set-PortablePythonEnvironment {
     param(
         [Parameter(Mandatory)]$Context,
         [Parameter(Mandatory)][System.Collections.IDictionary]$Manifest,
+        [Parameter(Mandatory)][string]$PythonCommand,
         [string]$Scope = 'User'
     )
 
-    Remove-CDrivePythonPathEntries -Context $Context -Manifest $Manifest -Scope $Scope
+    $externalPathEntries = Get-ExternalPythonPathEntries -Context $Context -PythonCommand $PythonCommand
+    Remove-CDrivePythonPathEntries -Context $Context -Manifest $Manifest -ExternalPathEntries $externalPathEntries -Scope $Scope
     Set-PortableEnvironmentValue -Context $Context -Manifest $Manifest -Name 'PYTHONUSERBASE' -Value $Context.UserBaseRoot -Scope $Scope
     Set-PortableEnvironmentValue -Context $Context -Manifest $Manifest -Name 'PYTHONPYCACHEPREFIX' -Value $Context.PyCacheRoot -Scope $Scope
     Set-PortableEnvironmentValue -Context $Context -Manifest $Manifest -Name 'PIP_CACHE_DIR' -Value $Context.PipCacheRoot -Scope $Scope
@@ -596,6 +722,13 @@ function Invoke-PortablePythonVerification {
         }
     }
 
+    $userPathEntries = @(Get-ExternalPythonPathEntries -Context $Context -PythonCommand (Find-PortablePythonCommand -Context $Context))
+    foreach ($entry in $userPathEntries) {
+        if (-not (Test-Path -LiteralPath $entry -PathType Container)) {
+            throw "Expected external Python PATH entry missing: $entry"
+        }
+    }
+
     $remnants = Test-NoCDrivePythonRemnants -Context $Context -AllowedBytes $AllowedRemnantBytes
     if (-not $remnants.Passed) {
         $Manifest['UnsupportedRemnants'] = @($remnants.Blocking)
@@ -630,6 +763,7 @@ function Invoke-PortablePythonMigration {
         [switch]$TestMode,
         [switch]$AllowNonFDriveForTests,
         [switch]$SkipProcessCheck,
+        [switch]$RemoveStorePythonPackages,
         [UInt64]$AllowedRemnantBytes = 0
     )
 
@@ -644,21 +778,26 @@ function Invoke-PortablePythonMigration {
     $manifest = New-PortablePythonManifest -Context $context
     $discovery = Get-PythonDiscovery -Context $context
 
-    if ($discovery.Unsupported.Count -gt 0 -or $discovery.Suspicious.Count -gt 0) {
-        $blocking = @($discovery.Unsupported + $discovery.Suspicious | Where-Object { $_.Bytes -gt $AllowedRemnantBytes })
+    if ($discovery.Suspicious.Count -gt 0) {
+        $blocking = @($discovery.Suspicious | Where-Object { $_.Bytes -gt $AllowedRemnantBytes })
         if ($blocking.Count -gt 0) {
             $manifest['UnsupportedRemnants'] = @($blocking)
             Save-PortablePythonManifest -Manifest $manifest -Path $context.ManifestPath
             $details = $blocking | ForEach-Object { "$($_.Classification): $($_.Path) ($($_.Bytes) bytes)" }
-            throw "Unclassified or unsupported Python-related C: paths were found. Refusing to guess:`n$($details -join "`n")"
+            throw "Unclassified Python-related C: paths were found. Refusing to guess:`n$($details -join "`n")"
         }
     }
 
+    Remove-UnsupportedPythonPackages -Context $context -Manifest $manifest -UnsupportedItems $discovery.Unsupported -RemoveStorePythonPackages:$RemoveStorePythonPackages
+    Save-PortablePythonManifest -Manifest $manifest -Path $context.ManifestPath
+
     if ($discovery.Candidates.Count -eq 0) {
         Install-FreshPortablePython -Context $context -Manifest $manifest -EmbeddedPythonZip $EmbeddedPythonZip -DownloadIfMissing:$DownloadIfMissing
+        Save-PortablePythonManifest -Manifest $manifest -Path $context.ManifestPath
     } else {
         foreach ($candidate in $discovery.Candidates) {
             Move-PythonCandidateToTarget -Context $context -Manifest $manifest -OriginalPath $candidate.Path
+            Save-PortablePythonManifest -Manifest $manifest -Path $context.ManifestPath
         }
     }
 
@@ -668,7 +807,10 @@ function Invoke-PortablePythonMigration {
     }
 
     New-PortablePythonWrappers -Context $context -Manifest $manifest -PythonCommand $pythonCommand
-    Set-PortablePythonEnvironment -Context $context -Manifest $manifest -Scope 'User'
+    Save-PortablePythonManifest -Manifest $manifest -Path $context.ManifestPath
+    Set-PortablePythonEnvironment -Context $context -Manifest $manifest -PythonCommand $pythonCommand -Scope 'User'
+    Save-PortablePythonManifest -Manifest $manifest -Path $context.ManifestPath
+    Assert-NoBlockingMachinePythonEnvironment -Context $context
     Invoke-PortablePythonVerification -Context $context -Manifest $manifest -AllowedRemnantBytes $AllowedRemnantBytes
     Save-PortablePythonManifest -Manifest $manifest -Path $context.ManifestPath
 
@@ -715,7 +857,8 @@ function Invoke-PortablePythonUndo {
         [string]$UserProfileRoot = $env:USERPROFILE,
         [switch]$TestMode,
         [switch]$AllowNonFDriveForTests,
-        [switch]$SkipProcessCheck
+        [switch]$SkipProcessCheck,
+        [switch]$AttemptStorePythonPackageReinstall
     )
 
     $context = Get-PortablePythonContext -TargetRoot $TargetRoot -SystemDriveRoot $SystemDriveRoot -UserProfileRoot $UserProfileRoot -TestMode:$TestMode -AllowNonFDriveForTests:$AllowNonFDriveForTests
@@ -746,6 +889,40 @@ function Invoke-PortablePythonUndo {
                 New-Item -ItemType Directory -Path $parent -Force | Out-Null
             }
             Move-Item -LiteralPath $item.ExternalPath -Destination $item.OriginalPath -Force
+        }
+    }
+
+    $removedUnsupported = @($manifest.RemovedUnsupportedItems)
+    [array]::Reverse($removedUnsupported)
+    foreach ($item in $removedUnsupported) {
+        if ($item.Method -eq 'TestModeMove' -and (Test-Path -LiteralPath $item.ExternalPath)) {
+            $parent = Split-Path -Path $item.OriginalPath -Parent
+            if (-not (Test-Path -LiteralPath $parent)) {
+                New-Item -ItemType Directory -Path $parent -Force | Out-Null
+            }
+            Move-Item -LiteralPath $item.ExternalPath -Destination $item.OriginalPath -Force
+        } elseif ($item.Method -eq 'Remove-AppxPackage') {
+            if ($AttemptStorePythonPackageReinstall) {
+                $wingetId = $null
+                if ($item.Name -match 'Python\.3\.([0-9]+)') {
+                    $wingetId = "Python.Python.3.$($Matches[1])"
+                }
+                if (-not $wingetId) {
+                    Write-Warning "Cannot infer winget id for removed Store package: $($item.PackageFullName)"
+                } else {
+                    $winget = Get-Command winget.exe -ErrorAction SilentlyContinue
+                    if (-not $winget) {
+                        Write-Warning "winget.exe not found; cannot reinstall removed Store package: $($item.PackageFullName)"
+                    } else {
+                        & $winget.Source install --id $wingetId --exact --source winget --accept-source-agreements --accept-package-agreements
+                        if ($LASTEXITCODE -ne 0) {
+                            Write-Warning "winget reinstall failed for $wingetId. Reinstall manually if needed."
+                        }
+                    }
+                }
+            } else {
+                Write-Warning "Undo cannot reliably reinstall removed Store package automatically unless -AttemptStorePythonPackageReinstall is used: $($item.PackageFullName)."
+            }
         }
     }
 

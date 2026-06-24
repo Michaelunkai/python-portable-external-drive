@@ -37,6 +37,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\Move-Python-ToExternalPort
 
 The script fails if Python processes are running, the target is not writable, unsupported Python remnants are found, or verification cannot prove the external wrappers are usable.
 
+If Microsoft Store Python packages are the only unsupported remnants and you want the script to remove them too, use:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\Move-Python-ToExternalPortable.ps1 -RemoveStorePythonPackages
+```
+
 ## Undo
 
 ```powershell
@@ -44,3 +50,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\Undo-Move-Python-ToExterna
 ```
 
 Undo reads the migration manifest from the target directory and restores the changes recorded there.
+
+If the migration removed Store Python packages and you want undo to attempt a best-effort `winget` reinstall, use:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\Undo-Move-Python-ToExternalPortable.ps1 -AttemptStorePythonPackageReinstall
+```

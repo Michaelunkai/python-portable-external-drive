@@ -7,7 +7,8 @@ param(
     [string]$UserProfileRoot = $env:USERPROFILE,
     [switch]$TestMode,
     [switch]$AllowNonFDriveForTests,
-    [switch]$SkipProcessCheck
+    [switch]$SkipProcessCheck,
+    [switch]$AttemptStorePythonPackageReinstall
 )
 
 Set-StrictMode -Version Latest
@@ -22,4 +23,5 @@ Invoke-PortablePythonUndo `
     -UserProfileRoot $UserProfileRoot `
     -TestMode:$TestMode `
     -AllowNonFDriveForTests:$AllowNonFDriveForTests `
-    -SkipProcessCheck:$SkipProcessCheck
+    -SkipProcessCheck:$SkipProcessCheck `
+    -AttemptStorePythonPackageReinstall:$AttemptStorePythonPackageReinstall
