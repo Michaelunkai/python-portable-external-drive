@@ -95,7 +95,8 @@ function Invoke-MoveScript {
         [switch]$DownloadIfMissing,
         [switch]$ExpectFailure,
         [switch]$RemoveStorePythonPackages,
-    [UInt64]$AllowedRemnantBytes = 0
+        [switch]$EnableProcessCheck,
+        [UInt64]$AllowedRemnantBytes = 0
     )
 
     $args = @(
@@ -107,9 +108,11 @@ function Invoke-MoveScript {
         '-UserProfileRoot', $Fixture.Profile,
         '-TestMode',
         '-AllowNonFDriveForTests',
-        '-SkipProcessCheck',
         '-AllowedRemnantBytes', $AllowedRemnantBytes
     )
+    if (-not $EnableProcessCheck) {
+        $args += '-SkipProcessCheck'
+    }
     if ($EmbeddedPythonZip) {
         $args += @('-EmbeddedPythonZip', $EmbeddedPythonZip)
     }
@@ -226,9 +229,58 @@ function Test-RemoveUnsupportedInTestMode {
     }
 }
 
+function Test-BlockingProcessOutputIsClean {
+    $fx = New-TestRoot
+    $started = $null
+    try {
+        $pythonPath = where.exe python 2>$null | Where-Object {
+            $_ -and
+            (Test-Path -LiteralPath $_ -PathType Leaf) -and
+            ($_ -notmatch '\\WindowsApps\\')
+        } | Select-Object -First 1
+        if (-not $pythonPath) {
+            $fallbackRoots = @(
+                (Join-Path $env:LOCALAPPDATA 'Programs\Python'),
+                (Join-Path $env:APPDATA 'uv\python'),
+                (Join-Path $env:LOCALAPPDATA 'uv'),
+                (Join-Path $env:USERPROFILE '.codex\tools')
+            )
+            foreach ($root in $fallbackRoots) {
+                if (Test-Path -LiteralPath $root) {
+                    $pythonPath = Get-ChildItem -LiteralPath $root -Recurse -Filter python.exe -File -ErrorAction SilentlyContinue |
+                        Select-Object -ExpandProperty FullName -First 1
+                    if ($pythonPath) { break }
+                }
+            }
+        }
+        if (-not $pythonPath) {
+            return
+        }
+        $started = Start-Process -FilePath $pythonPath `
+            -ArgumentList '-c "import time; time.sleep(60)"' `
+            -WindowStyle Hidden `
+            -PassThru
+        Start-Sleep -Seconds 2
+        New-FakePythonTree -Fixture $fx
+        New-Item -ItemType Directory -Path $fx.FTarget -Force | Out-Null
+        $result = Invoke-MoveScript -Fixture $fx -ExpectFailure -EnableProcessCheck
+        Assert-True ($result.ExitCode -ne 0) 'blocking Python process should fail before migration'
+        Assert-True ($result.Output -match 'Python-related processes are running') 'blocking process output should explain safety stop'
+        Assert-True ($result.Output -match "pid=$($started.Id)") 'blocking process output should include the test-owned Python process'
+        Assert-True ($result.Output -notmatch 'CategoryInfo|FullyQualifiedErrorId|At .*PythonPortableCommon') 'blocking process output should not include PowerShell stack details'
+        Assert-True ($result.Output -notmatch 'Idle pid=0') 'blocking process output should not include Windows Idle process'
+    } finally {
+        if ($started -and -not $started.HasExited) {
+            Stop-Process -Id $started.Id -Force -ErrorAction SilentlyContinue
+        }
+        Remove-Item -LiteralPath $fx.Root -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 Test-MoveAndUndo
 Test-FreshBootstrap
 Test-FailClosedUnsupported
 Test-RemoveUnsupportedInTestMode
+Test-BlockingProcessOutputIsClean
 
 "PASS: $script:PassCount assertions"

@@ -109,20 +109,72 @@ function Get-DirectorySizeBytes {
 
 function Get-PythonProcessSnapshot {
     Get-Process -ErrorAction SilentlyContinue |
-        Where-Object { $_.ProcessName -match '^(python|pythonw|py|pip|idle|jupyter|ipython)$' } |
+        Where-Object {
+            $_.Id -ne 0 -and
+            $_.ProcessName -ne 'Idle' -and
+            $_.ProcessName -match '^(python|pythonw|py|pip|jupyter|ipython)$'
+        } |
         Select-Object Id, ProcessName, Path
 }
 
 function Assert-NoPythonProcesses {
-    param([switch]$SkipProcessCheck)
+    param(
+        [switch]$SkipProcessCheck,
+        [switch]$StopBlockingPythonProcesses
+    )
 
     if ($SkipProcessCheck) {
         return
     }
     $running = @(Get-PythonProcessSnapshot)
     if ($running.Count -gt 0) {
-        $lines = $running | ForEach-Object { "$($_.ProcessName) pid=$($_.Id) path=$($_.Path)" }
-        throw "Python-related processes are running. Stop them before migration:`n$($lines -join "`n")"
+        $stopAttemptDetails = ''
+        if ($StopBlockingPythonProcesses) {
+            $stopErrors = @()
+            foreach ($process in $running) {
+                try {
+                    $liveProcess = Get-Process -Id $process.Id -ErrorAction SilentlyContinue
+                    if ($null -ne $liveProcess) {
+                        Stop-Process -Id $process.Id -Force -ErrorAction Stop
+                    }
+                } catch {
+                    $path = if ([string]::IsNullOrWhiteSpace($process.Path)) { '<unknown>' } else { $process.Path }
+                    $stopErrors += "  - $($process.ProcessName) pid=$($process.Id) path=$path error=$($_.Exception.Message)"
+                }
+            }
+            Start-Sleep -Seconds 2
+            $remaining = @(Get-PythonProcessSnapshot)
+            if ($remaining.Count -eq 0) {
+                return
+            }
+            $running = $remaining
+            if ($stopErrors.Count -gt 0) {
+                $stopAttemptDetails = @"
+
+Stop attempts that could not be completed cleanly:
+$($stopErrors -join "`n")
+"@
+            }
+        }
+
+        $lines = $running | Sort-Object ProcessName, Id | ForEach-Object {
+            $path = if ([string]::IsNullOrWhiteSpace($_.Path)) { '<unknown>' } else { $_.Path }
+            "  - $($_.ProcessName) pid=$($_.Id) path=$path"
+        }
+        throw @"
+Python-related processes are running, so migration did not start.
+
+This is a safety stop. Moving Python while any Python interpreter is active can corrupt virtual environments, running tools, caches, or the migration itself.
+
+Blocking processes:
+$($lines -join "`n")
+$stopAttemptDetails
+
+Safe options:
+  1. Close apps/tasks using Python, then rerun this script.
+  2. If you intentionally want this script to stop those Python processes first, rerun with -StopBlockingPythonProcesses.
+  3. Do not use -SkipProcessCheck unless you accept the risk of moving files used by live processes.
+"@
     }
 }
 
@@ -763,13 +815,14 @@ function Invoke-PortablePythonMigration {
         [switch]$TestMode,
         [switch]$AllowNonFDriveForTests,
         [switch]$SkipProcessCheck,
+        [switch]$StopBlockingPythonProcesses,
         [switch]$RemoveStorePythonPackages,
         [UInt64]$AllowedRemnantBytes = 0
     )
 
     $context = Get-PortablePythonContext -TargetRoot $TargetRoot -SystemDriveRoot $SystemDriveRoot -UserProfileRoot $UserProfileRoot -TestMode:$TestMode -AllowNonFDriveForTests:$AllowNonFDriveForTests
     Assert-PortableTarget -TargetRoot $context.TargetRoot -AllowNonFDriveForTests:$AllowNonFDriveForTests
-    Assert-NoPythonProcesses -SkipProcessCheck:$SkipProcessCheck
+    Assert-NoPythonProcesses -SkipProcessCheck:$SkipProcessCheck -StopBlockingPythonProcesses:$StopBlockingPythonProcesses
 
     if (Test-Path -LiteralPath $context.ManifestPath -PathType Leaf) {
         throw "Existing manifest found. Run undo first or move the old target aside: $($context.ManifestPath)"
@@ -858,11 +911,12 @@ function Invoke-PortablePythonUndo {
         [switch]$TestMode,
         [switch]$AllowNonFDriveForTests,
         [switch]$SkipProcessCheck,
+        [switch]$StopBlockingPythonProcesses,
         [switch]$AttemptStorePythonPackageReinstall
     )
 
     $context = Get-PortablePythonContext -TargetRoot $TargetRoot -SystemDriveRoot $SystemDriveRoot -UserProfileRoot $UserProfileRoot -TestMode:$TestMode -AllowNonFDriveForTests:$AllowNonFDriveForTests
-    Assert-NoPythonProcesses -SkipProcessCheck:$SkipProcessCheck
+    Assert-NoPythonProcesses -SkipProcessCheck:$SkipProcessCheck -StopBlockingPythonProcesses:$StopBlockingPythonProcesses
     $undoReceipt = Join-Path $context.TargetRoot 'python-portable-migration-manifest.undone.json'
     if (-not (Test-Path -LiteralPath $context.ManifestPath -PathType Leaf)) {
         if (Test-Path -LiteralPath $undoReceipt -PathType Leaf) {
